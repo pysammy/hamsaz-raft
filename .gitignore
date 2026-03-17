@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# CMake / build outputs
+build/
+cmake-build-*/
+CMakeCache.txt
+compile_commands.json
+
+# Benchmark/runtime outputs
+artifacts/
+logs/
+data/
+gossip_state_*.bin
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]

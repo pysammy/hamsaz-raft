@@ -1,0 +1,10 @@
+.git
+.github
+build
+artifacts
+analysis-results-*
+__pycache__
+*.pyc
+*.pyo
+*.log
+.DS_Store

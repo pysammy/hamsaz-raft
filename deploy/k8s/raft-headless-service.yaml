@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-headless
+  labels:
+    app: raft-node
+spec:
+  clusterIP: None
+  selector:
+    app: raft-node
+  ports:
+    - name: raft
+      port: 15000
+      targetPort: 15000
+    - name: api
+      port: 25000
+      targetPort: 25000

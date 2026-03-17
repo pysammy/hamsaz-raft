@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raft-node
+spec:
+  serviceName: raft-headless
+  replicas: 10
+  selector:
+    matchLabels:
+      app: raft-node
+  template:
+    metadata:
+      labels:
+        app: raft-node
+    spec:
+      containers:
+        - name: raft-node
+          image: hamsaz-raft:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/app/scripts/start_node_server.sh"]
+          env:
+            - name: NODES
+              value: "10"
+            - name: SERVICE_NAME
+              value: "raft-headless"
+            - name: RAFT_PORT
+              value: "15000"
+            - name: API_PORT
+              value: "25000"
+            - name: GOSSIP_DELAY
+              value: "2-8"
+            - name: GOSSIP_DROP
+              value: "0.0"
+          ports:
+            - name: raft
+              containerPort: 15000
+            - name: api
+              containerPort: 25000
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"

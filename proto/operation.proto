@@ -1,0 +1,45 @@
+syntax = "proto3";
+package hamsaz.v1;
+
+message Operation {
+  string op_id = 1;
+  enum Method {
+    REGISTER = 0;
+    ADD_COURSE = 1;
+    ENROLL = 2;
+    DELETE_COURSE = 3;
+    QUERY = 4;
+    UNENROLL = 5;
+  }
+  Method method = 2;
+  string arg1 = 3;
+  string arg2 = 4;
+  int64 logical_ts = 5; // optional
+}
+
+message OperationResult {
+  bool ok = 1;
+  string message = 2;
+  CoursewareState snapshot = 3; // set for query responses
+}
+
+message CoursewareState {
+  repeated string students = 1;
+  repeated string courses = 2;
+  repeated Enrollment enrollments = 3;
+}
+
+message Enrollment {
+  string student = 1;
+  string course = 2;
+}
+
+service ClientService {
+  rpc Execute(Operation) returns (OperationResult);
+  rpc Query(google.protobuf.Empty) returns (CoursewareState);
+}
+
+service ReplicaService {
+  rpc PushOperations(stream Operation) returns (google.protobuf.Empty);
+  rpc SyncState(CoursewareState) returns (google.protobuf.Empty);
+}
