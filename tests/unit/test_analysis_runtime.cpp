@@ -27,7 +27,7 @@ TEST(RuntimeTest, DependentOperationBlockedUntilPrereqsSeen) {
 
   Operation enroll{"op1", Method::Enroll, "alice", "CS101"};
   auto r1 = obj.apply(enroll);
-  EXPECT_THAT(r1.ok, IsFalse()); // deps missing
+  EXPECT_THAT(r1.ok, IsTrue()); // accepted and deferred
   EXPECT_THAT(r1.message, ::testing::HasSubstr("Deferred"));
 
   Operation reg{"op2", Method::Register, "alice", ""};

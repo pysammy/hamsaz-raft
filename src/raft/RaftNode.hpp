@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
+#include <string>
 
 #ifdef HAMSAZ_WITH_NURAFT
 #include "raft/StateMachine.hpp"
@@ -94,6 +95,12 @@ public:
   }
 
 private:
+  runtime::OperationResult applyReplicatedOperation(const runtime::Operation& op);
+  runtime::OperationResult applyLocalOperation(const runtime::Operation& op, bool propagate);
+  void trackAppliedOp(const runtime::Operation& op);
+  void processPendingReplicatedConflicts();
+  std::vector<std::string> prereqIdsForConflict(const runtime::Operation& op);
+  std::string courseKeyForOperation(const runtime::Operation& op) const;
   void registerGossipHandler();
   void storeEnvelope(const runtime::GossipEnvelope& env);
   void loadGossipState();
@@ -114,6 +121,11 @@ private:
   bool conflict_gate_enabled_{true};
   int node_id_{-1};
   std::unordered_set<std::string> seen_ops_;
+  std::unordered_set<std::string> applied_ops_;
+  std::unordered_map<std::string, std::deque<std::string>> course_write_history_;
+  std::deque<runtime::Operation> pending_replicated_conflicts_;
+  std::unordered_set<std::string> pending_replicated_conflict_ids_;
+  std::mutex apply_mu_;
   std::string node_name_;
   std::unordered_map<std::string, uint64_t> vc_; // vector clock
   std::deque<runtime::GossipEnvelope> pending_;

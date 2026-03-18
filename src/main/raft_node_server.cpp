@@ -3,6 +3,8 @@
 // Line protocol (tab-separated):
 //   PING
 //   MEMBERS
+//   INVARIANT
+//   STATE_HASH
 //   EXEC\t<op_id>\t<cmd>\t<arg1>\t<arg2>
 //   SHUTDOWN
 
@@ -20,8 +22,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -151,6 +155,51 @@ static bool readLine(int fd, std::string& out) {
   return true;
 }
 
+static void fnv1aAppendByte(uint64_t& h, uint8_t b) {
+  h ^= static_cast<uint64_t>(b);
+  h *= 1099511628211ULL;
+}
+
+static void fnv1aAppendU64(uint64_t& h, uint64_t v) {
+  for (int i = 0; i < 8; ++i) {
+    fnv1aAppendByte(h, static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+  }
+}
+
+static void fnv1aAppendString(uint64_t& h, const std::string& s) {
+  fnv1aAppendU64(h, static_cast<uint64_t>(s.size()));
+  for (unsigned char ch : s) {
+    fnv1aAppendByte(h, ch);
+  }
+}
+
+static std::string computeStateHash(const runtime::ReplicatedObject& obj) {
+  auto snap = obj.createSnapshot();
+  std::sort(snap.students.begin(), snap.students.end());
+  std::sort(snap.courses.begin(), snap.courses.end());
+  std::sort(snap.enrollments.begin(), snap.enrollments.end());
+
+  uint64_t h = 1469598103934665603ULL; // FNV-1a offset basis
+  fnv1aAppendString(h, "students");
+  fnv1aAppendU64(h, static_cast<uint64_t>(snap.students.size()));
+  for (const auto& s : snap.students) fnv1aAppendString(h, s);
+
+  fnv1aAppendString(h, "courses");
+  fnv1aAppendU64(h, static_cast<uint64_t>(snap.courses.size()));
+  for (const auto& c : snap.courses) fnv1aAppendString(h, c);
+
+  fnv1aAppendString(h, "enrollments");
+  fnv1aAppendU64(h, static_cast<uint64_t>(snap.enrollments.size()));
+  for (const auto& e : snap.enrollments) {
+    fnv1aAppendString(h, e.first);
+    fnv1aAppendString(h, e.second);
+  }
+
+  std::ostringstream oss;
+  oss << std::hex << std::setw(16) << std::setfill('0') << h;
+  return oss.str();
+}
+
 int main(int argc, char** argv) {
   Args args = parse_args(argc, argv);
   if (args.id == 0 || args.port == 0 || args.api_port == 0) {
@@ -262,6 +311,19 @@ int main(int argc, char** argv) {
     if (line == "PING") return "PONG";
     if (line == "MEMBERS") return "MEMBERS\t" + std::to_string(node.configSize());
     if (line == "LEADER") return std::string("LEADER\t") + (node.isLeader() ? "1" : "0");
+    if (line == "INVARIANT") {
+      std::lock_guard<std::mutex> lock(exec_mu);
+      return std::string("INVARIANT\t") + (obj.state().satisfiesInvariant() ? "1" : "0");
+    }
+    if (line == "STATE_HASH") {
+      std::lock_guard<std::mutex> lock(exec_mu);
+      const auto hash = computeStateHash(obj);
+      const auto& st = obj.state();
+      return "STATE_HASH\t" + hash + "\t" +
+             std::to_string(st.studentCount()) + "\t" +
+             std::to_string(st.courseCount()) + "\t" +
+             std::to_string(st.enrollmentCount());
+    }
     if (line == "STATS") {
       return "STATS\t" + std::to_string(node.totalRaftAppends()) + "\t" +
              std::to_string(node.conflictsQueued()) + "\t" +

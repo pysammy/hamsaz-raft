@@ -98,7 +98,9 @@ std::string encodeEnvBytes(const runtime::GossipEnvelope& env) {
 #endif
 RaftNode::RaftNode(runtime::ReplicatedObject& obj)
 #ifdef HAMSAZ_WITH_NURAFT
-    : obj_(obj), sm_(nuraft::cs_new<StateMachine>(obj)) {}
+    : obj_(obj),
+      sm_(nuraft::cs_new<StateMachine>(
+          obj, [this](const runtime::Operation& op) { return applyReplicatedOperation(op); })) {}
 #else
     : obj_(obj) {}
 #endif
@@ -109,10 +111,20 @@ runtime::OperationResult RaftNode::submit(const runtime::Operation& op) {
   bool send_to_raft = server_ &&
     (policy_ == RaftRoutingPolicy::AllOps || route == runtime::Route::Conflicting);
   if (send_to_raft) {
+    runtime::Operation raft_op = op;
+    if (route == runtime::Route::Conflicting) {
+      std::lock_guard<std::mutex> lock(apply_mu_);
+      raft_op.prereq_op_ids = prereqIdsForConflict(op);
+    }
     // For conflicting ops, gate on prerequisites before appending.
-    if (route == runtime::Route::Conflicting && conflict_gate_enabled_ && !obj_.prereqsSatisfied(op)) {
+    bool prereq_ready = true;
+    if (route == runtime::Route::Conflicting && conflict_gate_enabled_) {
+      std::lock_guard<std::mutex> lock(apply_mu_);
+      prereq_ready = obj_.prereqsSatisfied(op);
+    }
+    if (route == runtime::Route::Conflicting && conflict_gate_enabled_ && !prereq_ready) {
       // enqueue and return deferred
-      PendingConflict pc{op, std::chrono::steady_clock::now() + conflict_ttl_};
+      PendingConflict pc{raft_op, std::chrono::steady_clock::now() + conflict_ttl_};
       {
         std::lock_guard<std::mutex> lock(pending_conflict_mu_);
         pending_conflicts_.push_back(std::move(pc));
@@ -120,7 +132,7 @@ runtime::OperationResult RaftNode::submit(const runtime::Operation& op) {
       conflicts_queued_.fetch_add(1, std::memory_order_relaxed);
       return {false, "Deferred: conflict prerequisites not satisfied"};
     }
-    auto bytes = hamsaz::common::encodeOperation(op);
+    auto bytes = hamsaz::common::encodeOperation(raft_op);
     auto buf = nuraft::buffer::alloc(bytes.size());
     std::memcpy(buf->data_begin(), bytes.data(), bytes.size());
     auto append_res = server_->append_entries({buf});
@@ -137,21 +149,136 @@ runtime::OperationResult RaftNode::submit(const runtime::Operation& op) {
   if (!seen_ops_.insert(op.op_id).second) {
     return {true, ""}; // already applied locally
   }
-  // increment local clock for our node
-  vc_[node_name_] += 1;
-  auto res = obj_.apply(op);
-  if (res.ok && node_id_ >= 0) {
-    runtime::GossipHub::instance().broadcast(node_id_, op);
-    runtime::GossipEnvelope env;
-    env.sender = node_id_;
-    env.op = op;
-    env.vc = vc_;
-    storeEnvelope(env);
-    runtime::GossipEngine::instance().gossip(env);
-    // A successful local apply may have satisfied prerequisites for queued conflicts.
-    processPendingConflicts();
+  return applyLocalOperation(op, /*propagate=*/true);
+}
+
+runtime::OperationResult RaftNode::applyLocalOperation(const runtime::Operation& op, bool propagate) {
+  runtime::OperationResult res;
+  std::vector<runtime::Operation> applied;
+  {
+    std::lock_guard<std::mutex> lock(apply_mu_);
+    res = obj_.apply(op);
+    applied = obj_.consumeAppliedOperations();
+    for (const auto& applied_op : applied) {
+      trackAppliedOp(applied_op);
+      if (!propagate || node_id_ < 0) continue;
+      // In split-routing mode, only non-conflicting operations travel on gossip.
+      auto route = router_.classify(applied_op.method);
+      if (policy_ == RaftRoutingPolicy::ConflictsOnly && route == runtime::Route::Conflicting) {
+        continue;
+      }
+      vc_[node_name_] += 1;
+      runtime::GossipHub::instance().broadcast(node_id_, applied_op);
+      runtime::GossipEnvelope env;
+      env.sender = node_id_;
+      env.op = applied_op;
+      env.vc = vc_;
+      storeEnvelope(env);
+      runtime::GossipEngine::instance().gossip(env);
+    }
   }
+  processPendingConflicts();
+  processPendingReplicatedConflicts();
   return res;
+}
+
+runtime::OperationResult RaftNode::applyReplicatedOperation(const runtime::Operation& op) {
+  runtime::OperationResult res;
+  {
+    std::lock_guard<std::mutex> lock(apply_mu_);
+    seen_ops_.insert(op.op_id);
+    if (!op.prereq_op_ids.empty()) {
+      bool ready = true;
+      for (const auto& prereq_id : op.prereq_op_ids) {
+        if (applied_ops_.count(prereq_id) == 0) {
+          ready = false;
+          break;
+        }
+      }
+      if (!ready) {
+        if (pending_replicated_conflict_ids_.insert(op.op_id).second) {
+          pending_replicated_conflicts_.push_back(op);
+        }
+        return {true, "Deferred: replicated conflict prerequisites not yet materialized"};
+      }
+    }
+
+    res = obj_.apply(op);
+    auto applied = obj_.consumeAppliedOperations();
+    for (const auto& applied_op : applied) {
+      trackAppliedOp(applied_op);
+    }
+  }
+  processPendingReplicatedConflicts();
+  return res;
+}
+
+void RaftNode::trackAppliedOp(const runtime::Operation& op) {
+  applied_ops_.insert(op.op_id);
+  auto key = courseKeyForOperation(op);
+  if (key.empty()) return;
+  auto& hist = course_write_history_[key];
+  hist.push_back(op.op_id);
+  constexpr size_t kMaxPerCourse = 256;
+  while (hist.size() > kMaxPerCourse) hist.pop_front();
+}
+
+std::string RaftNode::courseKeyForOperation(const runtime::Operation& op) const {
+  using analysis::Method;
+  switch (op.method) {
+    case Method::AddCourse:
+    case Method::DeleteCourse:
+      return op.arg1;
+    case Method::Enroll:
+    case Method::Unenroll:
+      return op.arg2;
+    default:
+      return "";
+  }
+}
+
+std::vector<std::string> RaftNode::prereqIdsForConflict(const runtime::Operation& op) {
+  std::vector<std::string> out;
+  auto key = courseKeyForOperation(op);
+  if (key.empty()) return out;
+  auto it = course_write_history_.find(key);
+  if (it == course_write_history_.end()) return out;
+  out.assign(it->second.begin(), it->second.end());
+  return out;
+}
+
+void RaftNode::processPendingReplicatedConflicts() {
+  std::lock_guard<std::mutex> lock(apply_mu_);
+  if (pending_replicated_conflicts_.empty()) return;
+  while (true) {
+    std::deque<runtime::Operation> remaining;
+    bool progress = false;
+    while (!pending_replicated_conflicts_.empty()) {
+      auto op = pending_replicated_conflicts_.front();
+      pending_replicated_conflicts_.pop_front();
+      bool ready = true;
+      for (const auto& prereq_id : op.prereq_op_ids) {
+        if (applied_ops_.count(prereq_id) == 0) {
+          ready = false;
+          break;
+        }
+      }
+      if (!ready) {
+        remaining.push_back(std::move(op));
+        continue;
+      }
+      pending_replicated_conflict_ids_.erase(op.op_id);
+      auto res = obj_.apply(op);
+      (void)res;
+      auto applied = obj_.consumeAppliedOperations();
+      for (const auto& applied_op : applied) {
+        trackAppliedOp(applied_op);
+      }
+      progress = true;
+    }
+    pending_replicated_conflicts_.swap(remaining);
+    if (!progress) break;
+  }
 }
 
 #ifdef HAMSAZ_WITH_NURAFT
@@ -163,7 +290,8 @@ bool RaftNode::startSingleNode(int port) {
 bool RaftNode::startStandalone(int my_id, int port, bool skip_initial_election,
                                const std::string& advertise_host) {
   if (!sm_) {
-    sm_ = nuraft::cs_new<StateMachine>(obj_);
+    sm_ = nuraft::cs_new<StateMachine>(
+        obj_, [this](const runtime::Operation& op) { return applyReplicatedOperation(op); });
   }
   struct StderrLogger : public nuraft::logger {
     void put_details(int level, const char* source_file, const char* func_name,
@@ -222,7 +350,8 @@ bool RaftNode::startInProcCluster(int my_id, const std::vector<std::pair<int, in
 
 bool RaftNode::startInProcCluster(int my_id, const std::vector<std::tuple<int, std::string, int>>& cluster) {
   if (!sm_) {
-    sm_ = nuraft::cs_new<StateMachine>(obj_);
+    sm_ = nuraft::cs_new<StateMachine>(
+        obj_, [this](const runtime::Operation& op) { return applyReplicatedOperation(op); });
   }
   node_id_ = my_id;
   node_name_ = "n" + std::to_string(my_id);
@@ -294,8 +423,7 @@ void RaftNode::setPeers(const std::vector<int>& peers) {
 void RaftNode::registerGossipHandler() {
   runtime::GossipHub::instance().registerNode(node_id_, [this](const runtime::Operation& incoming) {
     if (!seen_ops_.insert(incoming.op_id).second) return;
-    obj_.apply(incoming);
-    processPendingConflicts();
+    applyLocalOperation(incoming, /*propagate=*/false);
   });
   runtime::GossipEngine::instance().registerNode(node_id_, [this](const runtime::GossipEnvelope& env) {
     // Handle clock-only heartbeat: env.op.method Unknown and op_id "__clock__"
@@ -324,7 +452,7 @@ void RaftNode::registerGossipHandler() {
       if (!is_deliverable(msg)) return false;
       bool first_time = seen_ops_.insert(msg.op.op_id).second;
       if (first_time) {
-        obj_.apply(msg.op);
+        applyLocalOperation(msg.op, /*propagate=*/false);
       }
       for (const auto& [n, c] : msg.vc) {
         vc_[n] = std::max(vc_[n], c);
@@ -348,6 +476,7 @@ void RaftNode::registerGossipHandler() {
       }
     }
     processPendingConflicts();
+    processPendingReplicatedConflicts();
   });
 }
 
@@ -404,6 +533,7 @@ void RaftNode::loadGossipState() {
     std::string opid(len, '\0');
     in.read(opid.data(), len);
     seen_ops_.insert(opid);
+    applied_ops_.insert(opid);
   }
   uint32_t env_sz = 0;
   read_u32(env_sz);
@@ -482,6 +612,7 @@ void RaftNode::startAntiEntropy() {
       }
       sendClockToPeers();
       processPendingConflicts();
+      processPendingReplicatedConflicts();
     }
   });
 }
@@ -528,7 +659,15 @@ void RaftNode::processPendingConflicts() {
       conflicts_dropped_.fetch_add(1, std::memory_order_relaxed);
       continue; // expired, drop
     }
-    if (!obj_.prereqsSatisfied(pc.op)) {
+    bool ready = false;
+    {
+      std::lock_guard<std::mutex> lock(apply_mu_);
+      ready = obj_.prereqsSatisfied(pc.op);
+      if (ready) {
+        pc.op.prereq_op_ids = prereqIdsForConflict(pc.op);
+      }
+    }
+    if (!ready) {
       // still not ready; keep it
       std::lock_guard<std::mutex> lock(pending_conflict_mu_);
       pending_conflicts_.push_back(pc);
