@@ -67,6 +67,7 @@ kubectl -n "${NAMESPACE}" get pods -l app=raft-node -o wide
 
 echo "[k8s-bench] starting port-forwards"
 declare -a PF_PIDS=()
+declare -a LOCAL_PORTS=()
 HOSTS=""
 
 cleanup() {
@@ -79,6 +80,7 @@ trap cleanup EXIT
 for i in $(seq 0 $((NODES - 1))); do
   pod="${STATEFULSET}-${i}"
   local_port=$((API_BASE_PORT + i))
+  LOCAL_PORTS+=("${local_port}")
   kubectl -n "${NAMESPACE}" port-forward "pod/${pod}" "${local_port}:25000" >"/tmp/${pod}-pf.log" 2>&1 &
   PF_PIDS+=("$!")
   if [[ -z "${HOSTS}" ]]; then
@@ -93,6 +95,38 @@ for pid in "${PF_PIDS[@]}"; do
   if ! kill -0 "${pid}" 2>/dev/null; then
     echo "[k8s-bench] a port-forward process exited unexpectedly" >&2
     exit 2
+  fi
+done
+
+wait_local_port() {
+  local port="$1"
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if python3 - "$port" <<'PY'
+import socket
+import sys
+p = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.5)
+try:
+    s.connect(("127.0.0.1", p))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+for p in "${LOCAL_PORTS[@]}"; do
+  if ! wait_local_port "${p}"; then
+    echo "[k8s-bench] local port ${p} did not become ready in time" >&2
+    exit 3
   fi
 done
 

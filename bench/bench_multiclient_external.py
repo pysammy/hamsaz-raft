@@ -223,6 +223,12 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
                 with fail_mu:
                     failures += 1
                 return
+            # Followers in older builds may reject conflicting writes.
+            # Retry by re-targeting another endpoint (likely leader).
+            lower_msg = msg.lower()
+            if "raft append rejected" in lower_msg or "not leader" in lower_msg:
+                idx = random.randrange(len(endpoints))
+                c = get_conn(idx)
             time.sleep(max(0, retry_delay_ms) / 1000.0)
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:

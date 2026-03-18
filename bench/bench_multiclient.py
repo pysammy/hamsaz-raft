@@ -283,6 +283,12 @@ def run_workload(api_ports: List[int], ops: List[str], concurrency: int, op_pref
                 with fail_mu:
                     failures += 1
                 return
+            # Followers in older builds may reject conflicting writes.
+            # Retry by re-targeting another node (likely leader) instead of pinning one endpoint.
+            lower_msg = msg.lower()
+            if "raft append rejected" in lower_msg or "not leader" in lower_msg:
+                node_idx = random.randrange(len(api_ports))
+                c = get_conn(node_idx)
             time.sleep(max(0, retry_delay_ms) / 1000.0)
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
