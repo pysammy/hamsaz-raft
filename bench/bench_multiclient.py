@@ -112,6 +112,34 @@ def parse_members(resp: str) -> int:
     return -1
 
 
+def parse_invariant(resp: str) -> bool:
+    parts = resp.split("\t")
+    if len(parts) != 2 or parts[0] != "INVARIANT":
+        raise RuntimeError(f"bad INVARIANT response: {resp}")
+    return parts[1] == "1"
+
+
+def parse_state_hash(resp: str) -> Dict[str, object]:
+    # STATE_HASH \t hash \t students \t courses \t enrollments
+    parts = resp.split("\t")
+    if len(parts) != 5 or parts[0] != "STATE_HASH":
+        raise RuntimeError(f"bad STATE_HASH response: {resp}")
+    return {
+        "hash": parts[1],
+        "students": int(parts[2]),
+        "courses": int(parts[3]),
+        "enrollments": int(parts[4]),
+    }
+
+
+def parse_stats(resp: str) -> Tuple[int, int, int, int]:
+    # STATS \t raft_appends \t queued \t appended_from_queue \t dropped
+    parts = resp.split("\t")
+    if len(parts) != 5 or parts[0] != "STATS":
+        raise RuntimeError(f"bad STATS response: {resp}")
+    return int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+
+
 def build_workload(ops: int, conflict_ratio: float, dependent_ratio: float) -> List[str]:
     num_conflict = int(ops * conflict_ratio)
     num_dependent = int(ops * dependent_ratio)
@@ -191,12 +219,16 @@ def wait_cluster_ready(api_ports: List[int], expected_members: int, timeout_sec:
     raise RuntimeError("cluster membership not reached")
 
 
-def run_workload(api_ports: List[int], ops: List[str], concurrency: int):
+def run_workload(api_ports: List[int], ops: List[str], concurrency: int, op_prefix: str,
+                 max_retries: int, retry_delay_ms: int, fail_on_op_errors: bool,
+                 request_timeout_sec: float):
     thread_local = threading.local()
     latencies: List[float] = []
     lat_mu = threading.Lock()
+    fail_mu = threading.Lock()
     all_conns: List[NodeConn] = []
     conn_mu = threading.Lock()
+    failures = 0
 
     first_send = None
     last_finish = None
@@ -211,31 +243,47 @@ def run_workload(api_ports: List[int], ops: List[str], concurrency: int):
             thread_local.conn_map = conn_map
         c = conn_map.get(node_idx)
         if c is None:
-            c = NodeConn("127.0.0.1", api_ports[node_idx], timeout=3.0)
+            c = NodeConn("127.0.0.1", api_ports[node_idx], timeout=request_timeout_sec)
             conn_map[node_idx] = c
             with conn_mu:
                 all_conns.append(c)
         return c
 
     def one(i: int):
-        nonlocal first_send, last_finish
+        nonlocal first_send, last_finish, failures
         node_idx = targets[i]
         cmd, a1, a2 = ops[i].split("\t")
-        op_id = f"mc-op-{i+1}"
+        op_id = f"{op_prefix}-op-{i+1}"
         line = f"EXEC\t{op_id}\t{cmd}\t{a1}\t{a2}"
-        t0 = time.time()
-        with time_mu:
-            if first_send is None:
-                first_send = t0
         c = get_conn(node_idx)
-        resp = c.request(line)
-        t1 = time.time()
-        with time_mu:
-            last_finish = t1
-        with lat_mu:
-            latencies.append(t1 - t0)
-        if not resp.startswith("RES\t"):
-            raise RuntimeError(f"bad response: {resp}")
+        max_attempts = max(1, max_retries + 1)
+        for attempt in range(max_attempts):
+            t0 = time.time()
+            with time_mu:
+                if first_send is None:
+                    first_send = t0
+            resp = c.request(line)
+            t1 = time.time()
+            with time_mu:
+                last_finish = t1
+            with lat_mu:
+                latencies.append(t1 - t0)
+
+            parts = resp.split("\t", 2)
+            if len(parts) < 2 or parts[0] != "RES":
+                raise RuntimeError(f"bad response: {resp}")
+            ok = parts[1] == "1"
+            msg = parts[2] if len(parts) >= 3 else ""
+            # Deferred means accepted for eventual processing.
+            if ok or msg.startswith("Deferred"):
+                return
+            if attempt + 1 >= max_attempts:
+                if fail_on_op_errors:
+                    raise RuntimeError(f"operation failed after retries: {resp}")
+                with fail_mu:
+                    failures += 1
+                return
+            time.sleep(max(0, retry_delay_ms) / 1000.0)
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         list(pool.map(one, range(len(ops))))
@@ -244,7 +292,7 @@ def run_workload(api_ports: List[int], ops: List[str], concurrency: int):
 
     for c in all_conns:
         c.close()
-    return latencies, wall
+    return latencies, wall, failures
 
 
 def parse_server_stats(logs: List[ProcLog]) -> Tuple[List[int], Dict[str, int]]:
@@ -263,6 +311,96 @@ def parse_server_stats(logs: List[ProcLog]) -> Tuple[List[int], Dict[str, int]]:
                 gate_stats["dropped"] += int(parts[-1])
 
     return raft_appends, gate_stats
+
+
+def verify_correctness(api_ports: List[int],
+                       settle_timeout_sec: float,
+                       settle_poll_ms: int):
+    t0 = time.time()
+    attempts = 0
+    last_state = None
+    while True:
+        attempts += 1
+        nodes = []
+        for i, port in enumerate(api_ports, start=1):
+            c = NodeConn("127.0.0.1", port, timeout=2.0)
+            try:
+                invariant_ok = parse_invariant(c.request("INVARIANT"))
+                state = parse_state_hash(c.request("STATE_HASH"))
+                nodes.append({
+                    "node": i,
+                    "endpoint": f"127.0.0.1:{port}",
+                    "invariant_ok": invariant_ok,
+                    **state,
+                })
+            finally:
+                c.close()
+
+        hashes = {n["hash"] for n in nodes}
+        all_invariants = all(n["invariant_ok"] for n in nodes)
+        converged = len(hashes) == 1 and all_invariants
+        elapsed = time.time() - t0
+        last_state = {
+            "converged": converged,
+            "all_invariants_ok": all_invariants,
+            "unique_hashes": sorted(hashes),
+            "settle_time_sec": elapsed,
+            "attempts": attempts,
+            "nodes": nodes,
+        }
+        if converged:
+            return last_state
+        if elapsed >= settle_timeout_sec:
+            return last_state
+        time.sleep(max(1, settle_poll_ms) / 1000.0)
+
+
+def fetch_gate_stats_api(api_ports: List[int]) -> Dict[str, int]:
+    gate = {"queued": 0, "appended_from_queue": 0, "dropped": 0}
+    for port in api_ports:
+        c = NodeConn("127.0.0.1", port, timeout=2.0)
+        try:
+            _, q, aq, dr = parse_stats(c.request("STATS"))
+            gate["queued"] += q
+            gate["appended_from_queue"] += aq
+            gate["dropped"] += dr
+        finally:
+            c.close()
+    return gate
+
+
+def pending_conflicts(gate: Dict[str, int]) -> int:
+    return max(0, gate["queued"] - gate["appended_from_queue"] - gate["dropped"])
+
+
+def drain_conflict_queue(api_ports: List[int], timeout_sec: float, poll_ms: int):
+    t0 = time.time()
+    attempts = 0
+    first_gate = fetch_gate_stats_api(api_ports)
+    while True:
+        attempts += 1
+        gate = fetch_gate_stats_api(api_ports)
+        pending = pending_conflicts(gate)
+        elapsed = time.time() - t0
+        if pending == 0:
+            return {
+                "drained": True,
+                "pending": pending,
+                "settle_time_sec": elapsed,
+                "attempts": attempts,
+                "start_gate": first_gate,
+                "end_gate": gate,
+            }
+        if elapsed >= timeout_sec:
+            return {
+                "drained": False,
+                "pending": pending,
+                "settle_time_sec": elapsed,
+                "attempts": attempts,
+                "start_gate": first_gate,
+                "end_gate": gate,
+            }
+        time.sleep(max(1, poll_ms) / 1000.0)
 
 
 def request_shutdown(api_port: int):
@@ -286,6 +424,8 @@ def main():
     ap.add_argument("--dependent-ratio", type=float, default=0.25)
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--gossip-udp", action="store_true")
+    ap.add_argument("--gossip-sim-only", action="store_true",
+                    help="do not auto-enable UDP gossip for split-routing runs")
     ap.add_argument("--gossip-delay", default="2-8")
     ap.add_argument("--gossip-drop", type=float, default=0.0)
     ap.add_argument("--all-to-raft", action="store_true")
@@ -294,9 +434,32 @@ def main():
     ap.add_argument("--inproc", action="store_true")
     ap.add_argument("--out", default="artifacts/bench_multiclient")
     ap.add_argument("--no-port-probe", action="store_true")
+    ap.add_argument("--verify-correctness", action="store_true",
+                    help="verify convergence (state hash + invariants) after workload")
+    ap.add_argument("--settle-timeout-sec", type=float, default=8.0,
+                    help="max time to wait for convergence checks")
+    ap.add_argument("--settle-poll-ms", type=int, default=200,
+                    help="poll interval for convergence checks")
+    ap.add_argument("--fail-on-correctness", action="store_true",
+                    help="exit non-zero if convergence/invariant check fails")
+    ap.add_argument("--max-retries", type=int, default=2,
+                    help="max retries for explicit RES\\t0 failures (Deferred is not retried)")
+    ap.add_argument("--retry-delay-ms", type=int, default=10,
+                    help="delay between retries for failed operations")
+    ap.add_argument("--request-timeout-sec", type=float, default=5.0,
+                    help="per-request socket timeout for benchmark clients")
+    ap.add_argument("--fail-on-op-errors", action="store_true",
+                    help="abort run if an operation still returns RES\\t0 after retries")
+    ap.add_argument("--drain-timeout-sec", type=float, default=3.0,
+                    help="max time to wait for queued conflict ops to drain before correctness check")
+    ap.add_argument("--drain-poll-ms", type=int, default=200,
+                    help="poll interval for queue-drain checks")
     args = ap.parse_args()
     if args.no_conflict_gate:
         print("[bench_mc] --no-conflict-gate is ignored; conflict gate is always enabled")
+    if not args.all_to_raft and not args.gossip_udp and not args.gossip_sim_only:
+        args.gossip_udp = True
+        print("[bench_mc] auto-enabled --gossip-udp for split-routing across processes")
 
     run_dir = Path(args.out) / now_ts()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +468,11 @@ def main():
         if path.exists():
             shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=True)
+    for p in Path(".").glob("gossip_state_*.bin"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
     raft_ports = [args.base_port + i for i in range(args.nodes)]
     api_ports = [args.api_base_port + i for i in range(args.nodes)]
@@ -324,7 +492,17 @@ def main():
 
         ops = build_workload(args.ops, args.conflict_ratio, args.dependent_ratio)
         print(f"[bench_mc] sending {len(ops)} ops concurrency={args.concurrency}")
-        latencies, wall_span = run_workload(api_ports, ops, args.concurrency)
+        op_prefix = f"mc-{now_ts()}-{random.randrange(1_000_000)}"
+        latencies, wall_span, op_failures = run_workload(
+            api_ports, ops, args.concurrency, op_prefix,
+            args.max_retries, args.retry_delay_ms, args.fail_on_op_errors,
+            args.request_timeout_sec
+        )
+        correctness = None
+        drain_info = None
+        if args.verify_correctness:
+            drain_info = drain_conflict_queue(api_ports, args.drain_timeout_sec, args.drain_poll_ms)
+            correctness = verify_correctness(api_ports, args.settle_timeout_sec, args.settle_poll_ms)
 
         for p in api_ports:
             request_shutdown(p)
@@ -367,11 +545,22 @@ def main():
             "wall_throughput_ops_per_sec": wall_throughput,
             "raft_appends": raft_appends,
             "conflict_gate_stats": gate_stats,
+            "drain": drain_info,
+            "correctness": correctness,
+            "op_failures": op_failures,
         }
         with open(run_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
 
         print(f"[bench_mc] avg latency {avg:.6f}s throughput_rtt {rtt_throughput:.1f} wall_throughput {wall_throughput:.1f}")
+        print(f"[bench_mc] op_failures={op_failures}")
+        if drain_info:
+            print(f"[bench_mc] drain drained={drain_info['drained']} pending={drain_info['pending']} "
+                  f"settle={drain_info['settle_time_sec']:.3f}s")
+        if correctness:
+            print(f"[bench_mc] correctness converged={correctness['converged']} "
+                  f"invariants={correctness['all_invariants_ok']} "
+                  f"settle={correctness['settle_time_sec']:.3f}s")
         print(f"[bench_mc] artifacts: {run_dir}")
 
         try:
@@ -399,6 +588,9 @@ def main():
         except Exception as e:
             print(f"[bench_mc] plotting skipped ({e})")
 
+        if args.fail_on_correctness and correctness and not correctness["converged"]:
+            print("[bench_mc] correctness verification failed")
+            return 2
         return 0
     finally:
         for p in api_ports:

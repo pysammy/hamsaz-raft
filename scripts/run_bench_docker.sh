@@ -15,8 +15,19 @@ API_HOST_BASE="${API_HOST_BASE:-35000}"
 IMAGE="${IMAGE:-hamsaz-raft:latest}"
 GOSSIP_DELAY="${GOSSIP_DELAY:-2-8}"
 GOSSIP_DROP="${GOSSIP_DROP:-0.0}"
+GOSSIP_UDP="${GOSSIP_UDP:-1}"
 KEEP_UP="${KEEP_UP:-0}"
 OUT_DIR="${OUT_DIR:-artifacts/bench_docker}"
+VERIFY_CORRECTNESS="${VERIFY_CORRECTNESS:-1}"
+FAIL_ON_CORRECTNESS="${FAIL_ON_CORRECTNESS:-1}"
+FAIL_ON_OP_ERRORS="${FAIL_ON_OP_ERRORS:-1}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_DELAY_MS="${RETRY_DELAY_MS:-10}"
+REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-5}"
+SETTLE_TIMEOUT_SEC="${SETTLE_TIMEOUT_SEC:-60}"
+SETTLE_POLL_MS="${SETTLE_POLL_MS:-200}"
+DRAIN_TIMEOUT_SEC="${DRAIN_TIMEOUT_SEC:-3}"
+DRAIN_POLL_MS="${DRAIN_POLL_MS:-200}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker command not found" >&2
@@ -46,6 +57,9 @@ echo "[docker-bench] generating compose file at ${COMPOSE_FILE}"
   for ((i=1; i<=NODES; ++i)); do
     api_host_port=$((API_HOST_BASE + i))
     cmd="/app/raft_node_server --id ${i} --host node${i} --port ${RAFT_PORT} --api-port ${API_PORT_IN_CONTAINER} --inproc --gossip-delay ${GOSSIP_DELAY} --gossip-drop ${GOSSIP_DROP}"
+    if [[ "${GOSSIP_UDP}" == "1" ]]; then
+      cmd="${cmd} --gossip-udp"
+    fi
     for ((j=1; j<=NODES; ++j)); do
       if [[ "${j}" -eq "${i}" ]]; then
         continue
@@ -88,6 +102,19 @@ for ((i=1; i<=NODES; ++i)); do
 done
 
 echo "[docker-bench] running external benchmark against: ${hosts}"
+bench_flags=()
+
+if [[ "${VERIFY_CORRECTNESS}" == "1" ]]; then
+  bench_flags+=(--verify-correctness)
+fi
+
+if [[ "${FAIL_ON_CORRECTNESS}" == "1" ]]; then
+  bench_flags+=(--fail-on-correctness)
+fi
+if [[ "${FAIL_ON_OP_ERRORS}" == "1" ]]; then
+  bench_flags+=(--fail-on-op-errors)
+fi
+
 python3 bench/bench_multiclient_external.py \
   --hosts "${hosts}" \
   --ops "${OPS}" \
@@ -95,6 +122,13 @@ python3 bench/bench_multiclient_external.py \
   --dependent-ratio "${DEPENDENT_RATIO}" \
   --concurrency "${CONCURRENCY}" \
   --wait-members "${NODES}" \
-  --out "${OUT_DIR}"
-
+  --max-retries "${MAX_RETRIES}" \
+  --retry-delay-ms "${RETRY_DELAY_MS}" \
+  --request-timeout-sec "${REQUEST_TIMEOUT_SEC}" \
+  --drain-timeout-sec "${DRAIN_TIMEOUT_SEC}" \
+  --drain-poll-ms "${DRAIN_POLL_MS}" \
+  --settle-timeout-sec "${SETTLE_TIMEOUT_SEC}" \
+  --settle-poll-ms "${SETTLE_POLL_MS}" \
+  --out "${OUT_DIR}" \
+  "${bench_flags[@]}"
 echo "[docker-bench] done"
