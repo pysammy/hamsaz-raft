@@ -8,7 +8,12 @@ OperationResult ReplicatedObject::apply(Operation op) {
 
   if (route == Route::Dependent && !tracker_.canExecute(op)) {
     tracker_.defer(op);
-    return {false, "Deferred: dependencies not satisfied"};
+    return {true, "Deferred: dependencies not satisfied"};
+  }
+
+  if (route == Route::Conflicting && !op.prereq_op_ids.empty() && !prereqsSatisfied(op)) {
+    deferredConflicts_.push_back(op);
+    return {true, "Deferred: conflict prerequisites not satisfied"};
   }
 
   auto result = applyDirect(op);
@@ -18,6 +23,7 @@ OperationResult ReplicatedObject::apply(Operation op) {
 
   // Record only on success.
   tracker_.record(op);
+  recentlyApplied_.push_back(op);
 
   // Invariant check after application.
   if (!state_.satisfiesInvariant()) {
@@ -32,6 +38,7 @@ OperationResult ReplicatedObject::apply(Operation op) {
       auto r = applyDirect(depOp);
       if (r.ok) {
         tracker_.record(depOp);
+        recentlyApplied_.push_back(depOp);
         if (!state_.satisfiesInvariant()) {
           return {false, "Invariant violated after deferred apply"};
         }
@@ -39,6 +46,34 @@ OperationResult ReplicatedObject::apply(Operation op) {
         // Drop failed deferred op but continue processing others.
       }
     }
+  }
+
+  // Process deferred conflicting operations once prerequisites become true.
+  while (true) {
+    std::deque<Operation> still_waiting;
+    bool progress = false;
+    while (!deferredConflicts_.empty()) {
+      auto conf = deferredConflicts_.front();
+      deferredConflicts_.pop_front();
+      if (!prereqsSatisfied(conf)) {
+        still_waiting.push_back(std::move(conf));
+        continue;
+      }
+      auto r = applyDirect(conf);
+      if (r.ok) {
+        tracker_.record(conf);
+        recentlyApplied_.push_back(conf);
+        progress = true;
+        if (!state_.satisfiesInvariant()) {
+          return {false, "Invariant violated after deferred conflict apply"};
+        }
+      } else {
+        // Keep waiting for state changes (e.g., missing course still absent).
+        still_waiting.push_back(std::move(conf));
+      }
+    }
+    deferredConflicts_.swap(still_waiting);
+    if (!progress) break;
   }
 
   return result;
@@ -104,6 +139,18 @@ void ReplicatedObject::restoreSnapshot(const common::SnapshotData& snap) {
   state_.rebuild(snap.students, snap.courses, snap.enrollments);
   tracker_.loadSeen(snap.seenStudents, snap.seenCourses);
   tracker_.clearDeferred();
+  deferredConflicts_.clear();
+  recentlyApplied_.clear();
+}
+
+std::vector<Operation> ReplicatedObject::consumeAppliedOperations() {
+  std::vector<Operation> out;
+  out.reserve(recentlyApplied_.size());
+  while (!recentlyApplied_.empty()) {
+    out.push_back(std::move(recentlyApplied_.front()));
+    recentlyApplied_.pop_front();
+  }
+  return out;
 }
 
 } // namespace hamsaz::runtime

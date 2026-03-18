@@ -18,7 +18,7 @@ nuraft::ptr<nuraft::buffer> StateMachine::commit(uint64_t log_idx, nuraft::buffe
   if (!op) {
     return nullptr;
   }
-  auto res = obj_.apply(*op);
+  auto res = apply_fn_ ? apply_fn_(*op) : obj_.apply(*op);
   if (!res.ok) {
     return nullptr;
   }

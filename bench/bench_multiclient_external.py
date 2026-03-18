@@ -101,6 +101,26 @@ def parse_stats(resp: str) -> Tuple[int, int, int, int]:
     return int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
 
 
+def parse_invariant(resp: str) -> bool:
+    parts = resp.split("\t")
+    if len(parts) != 2 or parts[0] != "INVARIANT":
+        raise RuntimeError(f"bad INVARIANT response: {resp}")
+    return parts[1] == "1"
+
+
+def parse_state_hash(resp: str) -> Dict[str, object]:
+    # STATE_HASH \t hash \t students \t courses \t enrollments
+    parts = resp.split("\t")
+    if len(parts) != 5 or parts[0] != "STATE_HASH":
+        raise RuntimeError(f"bad STATE_HASH response: {resp}")
+    return {
+        "hash": parts[1],
+        "students": int(parts[2]),
+        "courses": int(parts[3]),
+        "enrollments": int(parts[4]),
+    }
+
+
 def build_workload(ops: int, conflict_ratio: float, dependent_ratio: float) -> List[str]:
     num_conflict = int(ops * conflict_ratio)
     num_dependent = int(ops * dependent_ratio)
@@ -141,12 +161,16 @@ def wait_cluster_ready(endpoints: List[Tuple[str, int]], expected_members: int, 
     raise RuntimeError("cluster membership not reached")
 
 
-def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: int):
+def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: int, op_prefix: str,
+                 max_retries: int, retry_delay_ms: int, fail_on_op_errors: bool,
+                 request_timeout_sec: float):
     thread_local = threading.local()
     latencies: List[float] = []
     lat_mu = threading.Lock()
+    fail_mu = threading.Lock()
     all_conns: List[NodeConn] = []
     conn_mu = threading.Lock()
+    failures = 0
     time_mu = threading.Lock()
     first_send = None
     last_finish = None
@@ -161,29 +185,45 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
         c = conn_map.get(idx)
         if c is None:
             h, p = endpoints[idx]
-            c = NodeConn(h, p, timeout=3.0)
+            c = NodeConn(h, p, timeout=request_timeout_sec)
             conn_map[idx] = c
             with conn_mu:
                 all_conns.append(c)
         return c
 
     def one(i: int):
-        nonlocal first_send, last_finish
+        nonlocal first_send, last_finish, failures
         idx = targets[i]
         cmd, a1, a2 = ops[i].split("\t")
-        line = f"EXEC\text-op-{i+1}\t{cmd}\t{a1}\t{a2}"
-        t0 = time.time()
-        with time_mu:
-            if first_send is None:
-                first_send = t0
-        resp = get_conn(idx).request(line)
-        t1 = time.time()
-        with time_mu:
-            last_finish = t1
-        with lat_mu:
-            latencies.append(t1 - t0)
-        if not resp.startswith("RES\t"):
-            raise RuntimeError(f"bad response: {resp}")
+        line = f"EXEC\t{op_prefix}-op-{i+1}\t{cmd}\t{a1}\t{a2}"
+        c = get_conn(idx)
+        max_attempts = max(1, max_retries + 1)
+        for attempt in range(max_attempts):
+            t0 = time.time()
+            with time_mu:
+                if first_send is None:
+                    first_send = t0
+            resp = c.request(line)
+            t1 = time.time()
+            with time_mu:
+                last_finish = t1
+            with lat_mu:
+                latencies.append(t1 - t0)
+
+            parts = resp.split("\t", 2)
+            if len(parts) < 2 or parts[0] != "RES":
+                raise RuntimeError(f"bad response: {resp}")
+            ok = parts[1] == "1"
+            msg = parts[2] if len(parts) >= 3 else ""
+            if ok or msg.startswith("Deferred"):
+                return
+            if attempt + 1 >= max_attempts:
+                if fail_on_op_errors:
+                    raise RuntimeError(f"operation failed after retries: {resp}")
+                with fail_mu:
+                    failures += 1
+                return
+            time.sleep(max(0, retry_delay_ms) / 1000.0)
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         list(pool.map(one, range(len(ops))))
@@ -192,7 +232,7 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
         c.close()
 
     wall = 0.0 if first_send is None or last_finish is None else (last_finish - first_send)
-    return latencies, wall
+    return latencies, wall, failures
 
 
 def fetch_stats(endpoints: List[Tuple[str, int]]):
@@ -209,6 +249,82 @@ def fetch_stats(endpoints: List[Tuple[str, int]]):
         finally:
             c.close()
     return raft_appends, gate
+
+
+def verify_correctness(endpoints: List[Tuple[str, int]],
+                       settle_timeout_sec: float,
+                       settle_poll_ms: int):
+    t0 = time.time()
+    attempts = 0
+    last_state = None
+    while True:
+        attempts += 1
+        nodes = []
+        for i, (host, port) in enumerate(endpoints, start=1):
+            c = NodeConn(host, port, timeout=2.0)
+            try:
+                invariant_ok = parse_invariant(c.request("INVARIANT"))
+                state = parse_state_hash(c.request("STATE_HASH"))
+                nodes.append({
+                    "node": i,
+                    "endpoint": f"{host}:{port}",
+                    "invariant_ok": invariant_ok,
+                    **state,
+                })
+            finally:
+                c.close()
+
+        hashes = {n["hash"] for n in nodes}
+        all_invariants = all(n["invariant_ok"] for n in nodes)
+        converged = len(hashes) == 1 and all_invariants
+        elapsed = time.time() - t0
+        last_state = {
+            "converged": converged,
+            "all_invariants_ok": all_invariants,
+            "unique_hashes": sorted(hashes),
+            "settle_time_sec": elapsed,
+            "attempts": attempts,
+            "nodes": nodes,
+        }
+        if converged:
+            return last_state
+        if elapsed >= settle_timeout_sec:
+            return last_state
+        time.sleep(max(1, settle_poll_ms) / 1000.0)
+
+
+def pending_conflicts(gate: Dict[str, int]) -> int:
+    return max(0, gate["queued"] - gate["appended_from_queue"] - gate["dropped"])
+
+
+def drain_conflict_queue(endpoints: List[Tuple[str, int]], timeout_sec: float, poll_ms: int):
+    t0 = time.time()
+    attempts = 0
+    _, first_gate = fetch_stats(endpoints)
+    while True:
+        attempts += 1
+        _, gate = fetch_stats(endpoints)
+        pending = pending_conflicts(gate)
+        elapsed = time.time() - t0
+        if pending == 0:
+            return {
+                "drained": True,
+                "pending": pending,
+                "settle_time_sec": elapsed,
+                "attempts": attempts,
+                "start_gate": first_gate,
+                "end_gate": gate,
+            }
+        if elapsed >= timeout_sec:
+            return {
+                "drained": False,
+                "pending": pending,
+                "settle_time_sec": elapsed,
+                "attempts": attempts,
+                "start_gate": first_gate,
+                "end_gate": gate,
+            }
+        time.sleep(max(1, poll_ms) / 1000.0)
 
 
 def shutdown_nodes(endpoints: List[Tuple[str, int]]):
@@ -233,6 +349,26 @@ def main():
     ap.add_argument("--wait-members", type=int, default=0,
                     help="expected cluster membership (default: number of endpoints)")
     ap.add_argument("--wait-timeout-sec", type=float, default=30.0)
+    ap.add_argument("--verify-correctness", action="store_true",
+                    help="verify convergence (state hash + invariants) after workload")
+    ap.add_argument("--settle-timeout-sec", type=float, default=8.0,
+                    help="max time to wait for convergence checks")
+    ap.add_argument("--settle-poll-ms", type=int, default=200,
+                    help="poll interval for convergence checks")
+    ap.add_argument("--drain-timeout-sec", type=float, default=3.0,
+                    help="max time to wait for queued conflict ops to drain before correctness check")
+    ap.add_argument("--drain-poll-ms", type=int, default=200,
+                    help="poll interval for queue-drain checks")
+    ap.add_argument("--fail-on-correctness", action="store_true",
+                    help="exit non-zero if convergence/invariant check fails")
+    ap.add_argument("--max-retries", type=int, default=2,
+                    help="max retries for explicit RES\\t0 failures (Deferred is not retried)")
+    ap.add_argument("--retry-delay-ms", type=int, default=10,
+                    help="delay between retries for failed operations")
+    ap.add_argument("--request-timeout-sec", type=float, default=5.0,
+                    help="per-request socket timeout for benchmark clients")
+    ap.add_argument("--fail-on-op-errors", action="store_true",
+                    help="abort run if an operation still returns RES\\t0 after retries")
     ap.add_argument("--shutdown-after", action="store_true",
                     help="send SHUTDOWN to all endpoints when benchmark completes")
     ap.add_argument("--out", default="artifacts/bench_external")
@@ -247,8 +383,18 @@ def main():
     wait_cluster_ready(endpoints, expected_members, args.wait_timeout_sec)
     ops = build_workload(args.ops, args.conflict_ratio, args.dependent_ratio)
     print(f"[bench_ext] sending {len(ops)} ops concurrency={args.concurrency} endpoints={len(endpoints)}")
-    latencies, wall_span = run_workload(endpoints, ops, args.concurrency)
+    op_prefix = f"ext-{now_ts()}-{random.randrange(1_000_000)}"
+    latencies, wall_span, op_failures = run_workload(
+        endpoints, ops, args.concurrency, op_prefix,
+        args.max_retries, args.retry_delay_ms, args.fail_on_op_errors,
+        args.request_timeout_sec
+    )
     raft_appends, gate_stats = fetch_stats(endpoints)
+    correctness = None
+    drain_info = None
+    if args.verify_correctness:
+        drain_info = drain_conflict_queue(endpoints, args.drain_timeout_sec, args.drain_poll_ms)
+        correctness = verify_correctness(endpoints, args.settle_timeout_sec, args.settle_poll_ms)
 
     total = len(latencies)
     sum_lat = sum(latencies)
@@ -275,12 +421,23 @@ def main():
         "wall_throughput_ops_per_sec": wall_throughput,
         "raft_appends": raft_appends,
         "conflict_gate_stats": gate_stats,
+        "drain": drain_info,
         "endpoints": [f"{h}:{p}" for h, p in endpoints],
+        "correctness": correctness,
+        "op_failures": op_failures,
     }
     with open(run_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print(f"[bench_ext] avg latency {avg:.6f}s throughput_rtt {rtt_throughput:.1f} wall_throughput {wall_throughput:.1f}")
+    print(f"[bench_ext] op_failures={op_failures}")
+    if drain_info:
+        print(f"[bench_ext] drain drained={drain_info['drained']} pending={drain_info['pending']} "
+              f"settle={drain_info['settle_time_sec']:.3f}s")
+    if correctness:
+        print(f"[bench_ext] correctness converged={correctness['converged']} "
+              f"invariants={correctness['all_invariants_ok']} "
+              f"settle={correctness['settle_time_sec']:.3f}s")
     print(f"[bench_ext] artifacts: {run_dir}")
 
     try:
@@ -312,9 +469,12 @@ def main():
         shutdown_nodes(endpoints)
         print("[bench_ext] sent SHUTDOWN to all endpoints")
 
+    if args.fail_on_correctness and correctness and not correctness["converged"]:
+        print("[bench_ext] correctness verification failed")
+        return 2
+
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

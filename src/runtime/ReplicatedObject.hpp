@@ -7,6 +7,9 @@
 #include "runtime/OperationRouter.hpp"
 #include "common/SnapshotCodec.hpp"
 
+#include <deque>
+#include <vector>
+
 namespace hamsaz::runtime {
 
 // Single-node façade for Phase 1. In Phase 2 this will be driven by NuRaft.
@@ -18,6 +21,9 @@ public:
   common::SnapshotData createSnapshot() const;
   void restoreSnapshot(const common::SnapshotData& snap);
   bool prereqsSatisfied(const Operation& op) const;
+  // Returns operations that became applied since last call, including
+  // previously deferred operations that have just become executable.
+  std::vector<Operation> consumeAppliedOperations();
 
 private:
   OperationResult applyDirect(Operation& op);
@@ -25,6 +31,8 @@ private:
   domain::CoursewareState state_;
   OperationRouter router_;
   DependencyTracker tracker_;
+  std::deque<Operation> deferredConflicts_;
+  std::deque<Operation> recentlyApplied_;
 };
 
 } // namespace hamsaz::runtime

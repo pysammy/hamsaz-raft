@@ -8,6 +8,7 @@
 #ifdef HAMSAZ_WITH_NURAFT
 #include <libnuraft/nuraft.hxx>
 #endif
+#include <functional>
 
 namespace hamsaz::raft {
 
@@ -16,7 +17,9 @@ namespace hamsaz::raft {
 // Minimal NuRaft state machine wrapper. Applies operations to ReplicatedObject.
 class StateMachine : public nuraft::state_machine {
 public:
-  explicit StateMachine(runtime::ReplicatedObject& obj) : obj_(obj) {}
+  using ApplyFn = std::function<runtime::OperationResult(const runtime::Operation&)>;
+  explicit StateMachine(runtime::ReplicatedObject& obj, ApplyFn apply_fn = {})
+      : obj_(obj), apply_fn_(std::move(apply_fn)) {}
 
   nuraft::ptr<nuraft::buffer> commit(uint64_t log_idx, nuraft::buffer& data) override;
   bool apply_snapshot(nuraft::snapshot& s) override;
@@ -28,6 +31,7 @@ public:
 
 private:
   runtime::ReplicatedObject& obj_;
+  ApplyFn apply_fn_;
   uint64_t last_idx_{0};
   nuraft::ptr<nuraft::snapshot> last_snapshot_;
 };

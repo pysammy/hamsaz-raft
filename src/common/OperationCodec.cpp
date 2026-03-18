@@ -49,6 +49,11 @@ std::string encodeOperation(const runtime::Operation& op) {
   out.append(op.arg1);
   appendUint32(out, static_cast<uint32_t>(op.arg2.size()));
   out.append(op.arg2);
+  appendUint32(out, static_cast<uint32_t>(op.prereq_op_ids.size()));
+  for (const auto& prereq : op.prereq_op_ids) {
+    appendUint32(out, static_cast<uint32_t>(prereq.size()));
+    out.append(prereq);
+  }
   return out;
 }
 
@@ -65,6 +70,18 @@ std::optional<hamsaz::runtime::Operation> decodeOperation(const std::string& byt
   if (!readBytes(bytes, offset, len, op.arg1)) return std::nullopt;
   if (!readUint32(bytes, offset, len)) return std::nullopt;
   if (!readBytes(bytes, offset, len, op.arg2)) return std::nullopt;
+  // Backward-compatible tail decode: prereqs are optional.
+  if (offset == bytes.size()) return op;
+  uint32_t prereq_count = 0;
+  if (!readUint32(bytes, offset, prereq_count)) return std::nullopt;
+  op.prereq_op_ids.reserve(prereq_count);
+  for (uint32_t i = 0; i < prereq_count; ++i) {
+    if (!readUint32(bytes, offset, len)) return std::nullopt;
+    std::string prereq;
+    if (!readBytes(bytes, offset, len, prereq)) return std::nullopt;
+    op.prereq_op_ids.push_back(std::move(prereq));
+  }
+  if (offset != bytes.size()) return std::nullopt;
   return op;
 }
 

@@ -31,15 +31,19 @@ spec:
               value: "2-8"
             - name: GOSSIP_DROP
               value: "0.0"
+            - name: GOSSIP_UDP
+              value: "1"
           ports:
             - name: raft
               containerPort: 15000
             - name: api
               containerPort: 25000
+            - name: gossip
+              containerPort: 16000
           resources:
             requests:
-              cpu: "1"
-              memory: "512Mi"
+              cpu: "100m"
+              memory: "256Mi"
             limits:
-              cpu: "1"
+              cpu: "500m"
               memory: "512Mi"
