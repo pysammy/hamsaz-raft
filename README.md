@@ -116,6 +116,8 @@ cmake --build build -j
 scripts/repro_3node_external.sh
 ```
 
+On Windows, run this in WSL2 from the Linux filesystem path (for example `~/hamsaz-raft`), not `/mnt/c` or `/mnt/e`.
+
 Generated output:
 - `analysis-results-<YYYY-MM-DD>/three-node-external/README.md`
 - `analysis-results-<YYYY-MM-DD>/three-node-external/metrics_summary.csv`

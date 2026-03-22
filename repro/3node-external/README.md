@@ -45,6 +45,8 @@ cmake --build build -j
 scripts/repro_3node_external.sh
 ```
 
+On Windows + WSL2, run from the Linux filesystem (for example `~/hamsaz-raft`), not `/mnt/c` or `/mnt/e`, because mounted Windows paths can be much slower and can cause timeout-like behavior in convergence checks.
+
 By default this writes outputs to:
 
 ```text
@@ -55,6 +57,12 @@ To force a deterministic location:
 
 ```bash
 RESULT_ROOT=analysis-results-2026-03-21/three-node-external scripts/repro_3node_external.sh
+```
+
+If your machine is slower, increase settle/drain wait without changing benchmark semantics:
+
+```bash
+SETTLE_TIMEOUT_SEC=240 DRAIN_TIMEOUT_SEC=20 scripts/repro_3node_external.sh
 ```
 
 ## What gets produced

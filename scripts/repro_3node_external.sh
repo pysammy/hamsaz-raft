@@ -16,6 +16,10 @@ RESULT_ROOT="${RESULT_ROOT:-analysis-results-${DATE_TAG}/three-node-external}"
 MAX_RETRIES="${MAX_RETRIES:-100}"
 RETRY_DELAY_MS="${RETRY_DELAY_MS:-25}"
 REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-5}"
+SETTLE_TIMEOUT_SEC="${SETTLE_TIMEOUT_SEC:-120}"
+SETTLE_POLL_MS="${SETTLE_POLL_MS:-200}"
+DRAIN_TIMEOUT_SEC="${DRAIN_TIMEOUT_SEC:-8}"
+DRAIN_POLL_MS="${DRAIN_POLL_MS:-200}"
 
 if [[ ! -x "${BUILD_DIR}/raft_node_server" ]]; then
   echo "missing binary: ${BUILD_DIR}/raft_node_server" >&2
@@ -80,10 +84,10 @@ run_case() {
     --max-retries "${MAX_RETRIES}" \
     --retry-delay-ms "${RETRY_DELAY_MS}" \
     --request-timeout-sec "${REQUEST_TIMEOUT_SEC}" \
-    --settle-timeout-sec 60 \
-    --settle-poll-ms 200 \
-    --drain-timeout-sec 3 \
-    --drain-poll-ms 200 \
+    --settle-timeout-sec "${SETTLE_TIMEOUT_SEC}" \
+    --settle-poll-ms "${SETTLE_POLL_MS}" \
+    --drain-timeout-sec "${DRAIN_TIMEOUT_SEC}" \
+    --drain-poll-ms "${DRAIN_POLL_MS}" \
     --out "${out_dir}" >&2
   local rc=$?
   set -e

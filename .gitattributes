@@ -1,0 +1,32 @@
+# Normalize text files and prefer LF across this repo.
+* text=auto
+
+# Shell/Python scripts must stay LF (WSL/macOS/Linux execution).
+*.sh text eol=lf
+*.py text eol=lf
+
+# Source/build/config files.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.proto text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+Makefile text eol=lf
+
+# Docs and data text files.
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Binary artifacts.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.bin binary
