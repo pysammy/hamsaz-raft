@@ -4,6 +4,7 @@ metadata:
   name: raft-node
 spec:
   serviceName: raft-headless
+  podManagementPolicy: Parallel
   replicas: 10
   selector:
     matchLabels:

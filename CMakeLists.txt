@@ -62,9 +62,13 @@ target_link_libraries(hamsaz_cli PRIVATE hamsaz_core)
 
 option(HAMSAZ_WITH_NURAFT "Enable NuRaft integration (Phase 2)" OFF)
 option(HAMSAZ_BUILD_RAFT_HARNESS "Build Raft harness demo (requires NuRaft)" OFF)
+option(HAMSAZ_NURAFT_LOW_MEM_BUILD "Use lower-memory compile flags for NuRaft core objects" OFF)
 
 if (HAMSAZ_WITH_NURAFT)
   include(FetchContent)
+  # Avoid building NuRaft's own test binaries in Docker/K8s images.
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(NURAFT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
     nuraft
     GIT_REPOSITORY https://github.com/eBay/NuRaft.git
@@ -72,6 +76,19 @@ if (HAMSAZ_WITH_NURAFT)
   )
   FetchContent_MakeAvailable(nuraft)
   find_package(OpenSSL REQUIRED)
+
+  if (HAMSAZ_NURAFT_LOW_MEM_BUILD)
+    if (TARGET RAFT_CORE_OBJ)
+      # NuRaft's asio_service.cxx can be memory-heavy to compile in constrained Docker VMs.
+      # Append low-memory flags after NuRaft's defaults so they take precedence.
+      target_compile_options(RAFT_CORE_OBJ PRIVATE
+        -g0
+        -O0
+        -fno-var-tracking
+        -fno-inline-functions
+      )
+    endif()
+  endif()
 
   add_library(hamsaz_raft
     src/raft/StateMachine.cpp

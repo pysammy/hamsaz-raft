@@ -3,6 +3,7 @@
 
 # CMake / build outputs
 build/
+build-*/
 cmake-build-*/
 CMakeCache.txt
 compile_commands.json
@@ -17,3 +18,10 @@ gossip_state_*.bin
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Research notes / local analysis folders (not part of runtime repo)
+analysis-results-*/
+docs/
+myroughplan.md
+DEPENDENCIES_AND_CONFLICTS_IMPLEMENTATION.md
+MEETING_HANDOUT_DEPENDENCIES_CONFLICTS.md

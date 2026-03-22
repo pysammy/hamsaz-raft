@@ -8,6 +8,8 @@ SERVICE_NAME="${SERVICE_NAME:-raft-headless}"
 GOSSIP_DELAY="${GOSSIP_DELAY:-2-8}"
 GOSSIP_DROP="${GOSSIP_DROP:-0.0}"
 GOSSIP_UDP="${GOSSIP_UDP:-1}"
+ALL_TO_RAFT="${ALL_TO_RAFT:-0}"
+RESET_STATE_ON_START="${RESET_STATE_ON_START:-1}"
 
 if [[ -z "${HOSTNAME:-}" ]]; then
   echo "HOSTNAME is not set" >&2
@@ -22,10 +24,20 @@ fi
 
 id=$((ordinal + 1))
 
-args=(--id "${id}" --port "${RAFT_PORT}" --api-port "${API_PORT}" --inproc \
+if [[ "${RESET_STATE_ON_START}" == "1" ]]; then
+  rm -rf /app/data /app/logs
+  rm -f /app/gossip_state_*.bin
+fi
+
+my_host="${HOSTNAME}.${SERVICE_NAME}"
+args=(--id "${id}" --port "${RAFT_PORT}" --host "${my_host}" --api-port "${API_PORT}" --inproc \
       --gossip-delay "${GOSSIP_DELAY}" --gossip-drop "${GOSSIP_DROP}")
 if [[ "${GOSSIP_UDP}" == "1" ]]; then
   args+=(--gossip-udp)
+fi
+
+if [[ "${ALL_TO_RAFT}" == "1" ]]; then
+  args+=(--all-to-raft)
 fi
 
 for ((j = 1; j <= NODES; ++j)); do

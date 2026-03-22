@@ -1,5 +1,10 @@
 FROM ubuntu:24.04 AS builder
 
+ARG CMAKE_BUILD_TYPE=Release
+ARG BUILD_JOBS=1
+ARG CXX_FLAGS_RELEASE="-O0 -DNDEBUG"
+ARG HAMSAZ_NURAFT_LOW_MEM_BUILD=ON
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -15,8 +20,13 @@ WORKDIR /app
 COPY . /app
 
 RUN rm -rf build \
-    && cmake -S . -B build -DHAMSAZ_WITH_NURAFT=ON -DHAMSAZ_BUILD_TESTS=OFF \
-    && cmake --build build -j"$(nproc)"
+    && cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+      -DCMAKE_CXX_FLAGS_RELEASE="${CXX_FLAGS_RELEASE}" \
+      -DHAMSAZ_WITH_NURAFT=ON \
+      -DHAMSAZ_NURAFT_LOW_MEM_BUILD=${HAMSAZ_NURAFT_LOW_MEM_BUILD} \
+      -DHAMSAZ_BUILD_TESTS=OFF \
+    && cmake --build build -j"${BUILD_JOBS}"
 
 FROM ubuntu:24.04
 

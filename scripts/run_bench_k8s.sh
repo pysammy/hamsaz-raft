@@ -15,6 +15,8 @@ CONCURRENCY="${CONCURRENCY:-16}"
 API_BASE_PORT="${API_BASE_PORT:-37001}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600s}"
 OUT_DIR="${OUT_DIR:-artifacts/bench_k8s}"
+RESTART_BEFORE_BENCH="${RESTART_BEFORE_BENCH:-1}"  # 1 -> restart statefulset before each run
+API_READY_TIMEOUT_SEC="${API_READY_TIMEOUT_SEC:-180}"
 
 # Optional helpers for local kind flows.
 LOAD_IMAGE="${LOAD_IMAGE:-0}"            # 1 -> run `kind load docker-image`
@@ -26,8 +28,8 @@ SHUTDOWN_AFTER="${SHUTDOWN_AFTER:-0}"    # 1 -> send SHUTDOWN after benchmark
 VERIFY_CORRECTNESS="${VERIFY_CORRECTNESS:-1}"
 FAIL_ON_CORRECTNESS="${FAIL_ON_CORRECTNESS:-1}"
 FAIL_ON_OP_ERRORS="${FAIL_ON_OP_ERRORS:-1}"
-MAX_RETRIES="${MAX_RETRIES:-3}"
-RETRY_DELAY_MS="${RETRY_DELAY_MS:-10}"
+MAX_RETRIES="${MAX_RETRIES:-20}"
+RETRY_DELAY_MS="${RETRY_DELAY_MS:-20}"
 REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-5}"
 SETTLE_TIMEOUT_SEC="${SETTLE_TIMEOUT_SEC:-60}"
 SETTLE_POLL_MS="${SETTLE_POLL_MS:-200}"
@@ -59,6 +61,10 @@ fi
 echo "[k8s-bench] scaling ${STATEFULSET} to ${NODES} replicas"
 kubectl -n "${NAMESPACE}" scale "statefulset/${STATEFULSET}" --replicas="${NODES}" >/dev/null
 kubectl -n "${NAMESPACE}" set env "statefulset/${STATEFULSET}" "NODES=${NODES}" >/dev/null
+if [[ "${RESTART_BEFORE_BENCH}" == "1" ]]; then
+  echo "[k8s-bench] restarting ${STATEFULSET} for a clean baseline"
+  kubectl -n "${NAMESPACE}" rollout restart "statefulset/${STATEFULSET}" >/dev/null
+fi
 kubectl -n "${NAMESPACE}" rollout status "statefulset/${STATEFULSET}" --timeout="${WAIT_TIMEOUT}" >/dev/null
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l app=raft-node --timeout=180s >/dev/null
 
@@ -129,6 +135,56 @@ for p in "${LOCAL_PORTS[@]}"; do
     exit 3
   fi
 done
+
+echo "[k8s-bench] validating API readiness on all forwarded endpoints"
+if ! python3 - "${NODES}" "${API_READY_TIMEOUT_SEC}" "${LOCAL_PORTS[@]}" <<'PY'
+import socket
+import sys
+import time
+
+expected = int(sys.argv[1])
+deadline_sec = float(sys.argv[2])
+ports = [int(p) for p in sys.argv[3:]]
+
+def request(port: int, line: str) -> str:
+    s = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    f = s.makefile("rwb", buffering=0)
+    try:
+        f.write((line + "\n").encode("utf-8"))
+        f.flush()
+        return f.readline().decode("utf-8", errors="replace").strip()
+    finally:
+        s.close()
+
+deadline = time.time() + deadline_sec
+while time.time() < deadline:
+    ok = True
+    for p in ports:
+        try:
+            if request(p, "PING") != "PONG":
+                print(f"[k8s-bench][ready] port {p} bad PING", file=sys.stderr)
+                ok = False
+                break
+            members = request(p, "MEMBERS")
+            parts = members.split("\t")
+            if len(parts) != 2 or parts[0] != "MEMBERS" or int(parts[1]) < expected:
+                print(f"[k8s-bench][ready] port {p} MEMBERS response: {members}", file=sys.stderr)
+                ok = False
+                break
+        except Exception as e:
+            print(f"[k8s-bench][ready] port {p} error: {e}", file=sys.stderr)
+            ok = False
+            break
+    if ok:
+        sys.exit(0)
+    time.sleep(1.0)
+
+sys.exit(1)
+PY
+then
+  echo "[k8s-bench] API readiness check failed" >&2
+  exit 4
+fi
 
 echo "[k8s-bench] running external benchmark"
 cmd=(
