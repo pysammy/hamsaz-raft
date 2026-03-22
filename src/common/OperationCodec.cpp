@@ -35,6 +35,20 @@ bool readBytes(const std::string& in, size_t& offset, uint32_t len, std::string&
   return true;
 }
 
+bool isValidMethod(uint8_t raw) {
+  switch (static_cast<Method>(raw)) {
+    case Method::Register:
+    case Method::AddCourse:
+    case Method::Enroll:
+    case Method::DeleteCourse:
+    case Method::Query:
+    case Method::Unenroll:
+      return true;
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 namespace hamsaz::common {
@@ -64,7 +78,9 @@ std::optional<hamsaz::runtime::Operation> decodeOperation(const std::string& byt
   if (!readUint32(bytes, offset, len)) return std::nullopt;
   if (!readBytes(bytes, offset, len, op.op_id)) return std::nullopt;
   if (offset >= bytes.size()) return std::nullopt;
-  op.method = static_cast<Method>(static_cast<uint8_t>(bytes[offset]));
+  auto raw_method = static_cast<uint8_t>(bytes[offset]);
+  if (!isValidMethod(raw_method)) return std::nullopt;
+  op.method = static_cast<Method>(raw_method);
   offset += 1;
   if (!readUint32(bytes, offset, len)) return std::nullopt;
   if (!readBytes(bytes, offset, len, op.arg1)) return std::nullopt;

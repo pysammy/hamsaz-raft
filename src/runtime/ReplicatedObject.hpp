@@ -26,7 +26,8 @@ public:
   std::vector<Operation> consumeAppliedOperations();
 
 private:
-  OperationResult applyDirect(Operation& op);
+  OperationResult applyDirect(domain::CoursewareState& target, Operation& op) const;
+  OperationResult applyAtomically(Operation op);
 
   domain::CoursewareState state_;
   OperationRouter router_;

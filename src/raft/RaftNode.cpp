@@ -146,8 +146,11 @@ runtime::OperationResult RaftNode::submit(const runtime::Operation& op) {
   }
 #endif
   // Dependent/Independent or no server: apply locally and gossip.
-  if (!seen_ops_.insert(op.op_id).second) {
-    return {true, ""}; // already applied locally
+  {
+    std::lock_guard<std::mutex> lock(apply_mu_);
+    if (!seen_ops_.insert(op.op_id).second) {
+      return {true, ""}; // already applied locally
+    }
   }
   return applyLocalOperation(op, /*propagate=*/true);
 }
@@ -326,15 +329,15 @@ bool RaftNode::startStandalone(int my_id, int port, bool skip_initial_election,
     std::cerr << "[RaftNode] launcher init returned null (check port/bind permissions)\n";
     return false;
   }
-  for (int i = 0; i < 200 && !server_->is_initialized(); ++i) {
+  for (int i = 0; i < 600 && !server_->is_initialized(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (!server_->is_initialized()) {
+    std::cerr << "[RaftNode] server not initialized after wait (continuing)\n";
   }
   if (server_) {
     registerGossipHandler();
     startAntiEntropy();
-  }
-  if (!server_->is_initialized()) {
-    std::cerr << "[RaftNode] server not initialized after wait (continuing to allow join)\n";
   }
   return static_cast<bool>(server_);
 }
@@ -388,18 +391,15 @@ bool RaftNode::startInProcCluster(int my_id, const std::vector<std::tuple<int, s
 
   server_ = launcher_->init(sm_, smgr, nullptr, my_port, asio_opt, params);
   if (!server_) return false;
-  for (int i = 0; i < 200 && !server_->is_initialized(); ++i) {
+  for (int i = 0; i < 600 && !server_->is_initialized(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   if (!server_->is_initialized()) {
-    std::cerr << "[RaftNode] server " << my_id << " not initialized after wait\n";
+    std::cerr << "[RaftNode] server " << my_id << " not initialized after wait (continuing)\n";
   }
   if (server_) {
     registerGossipHandler();
     startAntiEntropy();
-  }
-  if (!server_->is_initialized()) {
-    std::cerr << "[RaftNode] server " << my_id << " not initialized after wait (continuing)\n";
   }
   return static_cast<bool>(server_);
 }
@@ -422,7 +422,10 @@ void RaftNode::setPeers(const std::vector<int>& peers) {
 
 void RaftNode::registerGossipHandler() {
   runtime::GossipHub::instance().registerNode(node_id_, [this](const runtime::Operation& incoming) {
-    if (!seen_ops_.insert(incoming.op_id).second) return;
+    {
+      std::lock_guard<std::mutex> lock(apply_mu_);
+      if (!seen_ops_.insert(incoming.op_id).second) return;
+    }
     applyLocalOperation(incoming, /*propagate=*/false);
   });
   runtime::GossipEngine::instance().registerNode(node_id_, [this](const runtime::GossipEnvelope& env) {
@@ -437,6 +440,7 @@ void RaftNode::registerGossipHandler() {
 
     auto is_deliverable = [this](const runtime::GossipEnvelope& msg) {
       std::string sender_name = "n" + std::to_string(msg.sender);
+      std::lock_guard<std::mutex> lock(apply_mu_);
       for (const auto& [node, cnt] : msg.vc) {
         uint64_t local = vc_[node];
         if (node == sender_name) {
@@ -450,12 +454,19 @@ void RaftNode::registerGossipHandler() {
 
     auto try_apply = [this,&is_deliverable](const runtime::GossipEnvelope& msg) {
       if (!is_deliverable(msg)) return false;
-      bool first_time = seen_ops_.insert(msg.op.op_id).second;
+      bool first_time = false;
+      {
+        std::lock_guard<std::mutex> lock(apply_mu_);
+        first_time = seen_ops_.insert(msg.op.op_id).second;
+      }
       if (first_time) {
         applyLocalOperation(msg.op, /*propagate=*/false);
       }
-      for (const auto& [n, c] : msg.vc) {
-        vc_[n] = std::max(vc_[n], c);
+      {
+        std::lock_guard<std::mutex> lock(apply_mu_);
+        for (const auto& [n, c] : msg.vc) {
+          vc_[n] = std::max(vc_[n], c);
+        }
       }
       storeEnvelope(msg);
       return true;
@@ -589,7 +600,7 @@ void RaftNode::storeEnvelope(const runtime::GossipEnvelope& env) {
   std::lock_guard<std::mutex> lock(gossip_mu_);
   recent_envelopes_.push_back(env);
   envelope_by_op_[env.op.op_id] = env;
-  constexpr size_t kMaxRecent = 256;
+  constexpr size_t kMaxRecent = 20000;
   if (recent_envelopes_.size() > kMaxRecent) {
     envelope_by_op_.erase(recent_envelopes_.front().op.op_id);
     recent_envelopes_.pop_front();
@@ -620,7 +631,10 @@ void RaftNode::startAntiEntropy() {
 void RaftNode::sendClockToPeers() {
   runtime::GossipEnvelope clock;
   clock.sender = node_id_;
-  clock.vc = vc_;
+  {
+    std::lock_guard<std::mutex> lock(apply_mu_);
+    clock.vc = vc_;
+  }
   clock.op = runtime::Operation{"__clock__", hamsaz::analysis::Method::Unknown, "", ""};
   for (int pid : peers_) {
     runtime::GossipEngine::instance().gossipTo(pid, clock);

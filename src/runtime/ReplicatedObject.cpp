@@ -16,18 +16,9 @@ OperationResult ReplicatedObject::apply(Operation op) {
     return {true, "Deferred: conflict prerequisites not satisfied"};
   }
 
-  auto result = applyDirect(op);
+  auto result = applyAtomically(op);
   if (!result.ok) {
     return result;
-  }
-
-  // Record only on success.
-  tracker_.record(op);
-  recentlyApplied_.push_back(op);
-
-  // Invariant check after application.
-  if (!state_.satisfiesInvariant()) {
-    return {false, "Invariant violated after apply"};
   }
 
   // Try to apply any deferred ops that just became ready.
@@ -35,16 +26,9 @@ OperationResult ReplicatedObject::apply(Operation op) {
     auto ready = tracker_.takeReady();
     if (ready.empty()) break;
     for (auto& depOp : ready) {
-      auto r = applyDirect(depOp);
-      if (r.ok) {
-        tracker_.record(depOp);
-        recentlyApplied_.push_back(depOp);
-        if (!state_.satisfiesInvariant()) {
-          return {false, "Invariant violated after deferred apply"};
-        }
-      } else {
-        // Drop failed deferred op but continue processing others.
-      }
+      auto r = applyAtomically(depOp);
+      (void)r;
+      // Keep existing behavior: drop failed deferred op but continue.
     }
   }
 
@@ -59,14 +43,9 @@ OperationResult ReplicatedObject::apply(Operation op) {
         still_waiting.push_back(std::move(conf));
         continue;
       }
-      auto r = applyDirect(conf);
+      auto r = applyAtomically(conf);
       if (r.ok) {
-        tracker_.record(conf);
-        recentlyApplied_.push_back(conf);
         progress = true;
-        if (!state_.satisfiesInvariant()) {
-          return {false, "Invariant violated after deferred conflict apply"};
-        }
       } else {
         // Keep waiting for state changes (e.g., missing course still absent).
         still_waiting.push_back(std::move(conf));
@@ -76,6 +55,21 @@ OperationResult ReplicatedObject::apply(Operation op) {
     if (!progress) break;
   }
 
+  return result;
+}
+
+OperationResult ReplicatedObject::applyAtomically(Operation op) {
+  domain::CoursewareState next_state = state_;
+  auto result = applyDirect(next_state, op);
+  if (!result.ok) {
+    return result;
+  }
+  if (!next_state.satisfiesInvariant()) {
+    return {false, "Invariant violated after apply"};
+  }
+  state_ = std::move(next_state);
+  tracker_.record(op);
+  recentlyApplied_.push_back(std::move(op));
   return result;
 }
 
@@ -90,29 +84,29 @@ bool ReplicatedObject::prereqsSatisfied(const Operation& op) const {
   }
 }
 
-OperationResult ReplicatedObject::applyDirect(Operation& op) {
+OperationResult ReplicatedObject::applyDirect(domain::CoursewareState& target, Operation& op) const {
   using analysis::Method;
   bool ok = false;
   std::string msg;
   switch (op.method) {
     case Method::Register:
-      ok = state_.registerStudent(op.arg1);
+      ok = target.registerStudent(op.arg1);
       if (!ok) msg = "Student already exists";
       break;
     case Method::AddCourse:
-      ok = state_.addCourse(op.arg1);
+      ok = target.addCourse(op.arg1);
       if (!ok) msg = "Course already exists";
       break;
     case Method::Enroll:
-      ok = state_.enroll(op.arg1, op.arg2);
+      ok = target.enroll(op.arg1, op.arg2);
       if (!ok) msg = "Enroll failed (missing prereqs or duplicate)";
       break;
     case Method::Unenroll:
-      ok = state_.unenroll(op.arg1, op.arg2);
+      ok = target.unenroll(op.arg1, op.arg2);
       if (!ok) msg = "Unenroll failed (not enrolled)";
       break;
     case Method::DeleteCourse:
-      ok = state_.deleteCourse(op.arg1);
+      ok = target.deleteCourse(op.arg1);
       if (!ok) msg = "Course not found";
       break;
     case Method::Query:

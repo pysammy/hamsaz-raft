@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <netdb.h>
 #include <unistd.h>
 
 namespace hamsaz::runtime {
@@ -93,6 +94,29 @@ bool decodeEnvelope(const uint8_t* data, size_t len, GossipEnvelope& out_env) {
   if (!op) return false;
   out_env.op = *op;
   return p == end;
+}
+
+bool resolvePeerAddr(const GossipConfig::Peer& peer, sockaddr_in& out_addr) {
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(peer.port);
+  if (inet_pton(AF_INET, peer.host.c_str(), &addr.sin_addr) == 1) {
+    out_addr = addr;
+    return true;
+  }
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  addrinfo* res = nullptr;
+  if (getaddrinfo(peer.host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+    if (res) freeaddrinfo(res);
+    return false;
+  }
+  auto* sin = reinterpret_cast<sockaddr_in*>(res->ai_addr);
+  addr.sin_addr = sin->sin_addr;
+  freeaddrinfo(res);
+  out_addr = addr;
+  return true;
 }
 
 } // namespace
@@ -223,29 +247,34 @@ void GossipEngine::rebuildPeerTableLocked() {
   peer_table_.clear();
   for (const auto& peer : cfg_.peers) {
     sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(peer.port);
-    inet_pton(AF_INET, peer.host.c_str(), &addr.sin_addr);
-    peer_table_[peer.id] = addr;
+    if (resolvePeerAddr(peer, addr)) {
+      peer_table_[peer.id] = addr;
+    }
   }
 }
 
 void GossipEngine::sendUdp(int target_id, const GossipEnvelope& env) {
-  std::vector<int> targets;
+  std::vector<sockaddr_in> targets;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    // Re-resolve peer hostnames each send to avoid stale pod IPs after restarts.
+    rebuildPeerTableLocked();
     if (target_id == -1) {
-      targets = broadcastTargetsLocked(env.sender);
+      for (const auto& [peer_id, addr] : peer_table_) {
+        if (peer_id == env.sender) continue;
+        targets.push_back(addr);
+      }
     } else {
-      targets.push_back(target_id);
+      auto it = peer_table_.find(target_id);
+      if (it != peer_table_.end()) {
+        targets.push_back(it->second);
+      }
     }
   }
   auto bytes = encodeEnvelope(env);
-  for (int tid : targets) {
-    auto it = peer_table_.find(tid);
-    if (it == peer_table_.end()) continue;
+  for (const auto& addr : targets) {
     sendto(udp_fd_, bytes.data(), bytes.size(), 0,
-           reinterpret_cast<const sockaddr*>(&it->second), sizeof(sockaddr_in));
+           reinterpret_cast<const sockaddr*>(&addr), sizeof(sockaddr_in));
   }
 }
 

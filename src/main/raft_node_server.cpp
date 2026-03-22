@@ -259,21 +259,25 @@ int main(int argc, char** argv) {
             << " api=0.0.0.0:" << args.api_port
             << " leader? " << (node.isLeader() ? "yes" : "no") << "\n";
 
-  if (!args.inproc) {
-    auto try_add_peers = [&]() {
-      if (!node.isLeader()) return;
-      std::vector<std::tuple<int, std::string, int>> remaining;
-      for (auto& p : args.peers) {
-        int pid; std::string host; int prt;
-        std::tie(pid, host, prt) = p;
-        if (!node.addServer(pid, host + ":" + std::to_string(prt))) {
-          remaining.push_back(p);
-        } else {
-          std::cout << "add_srv ok for peer " << pid << "\n";
-        }
+  std::vector<std::tuple<int, std::string, int>> pending_peers = args.peers;
+  std::mutex peers_mu;
+  auto try_add_peers = [&]() {
+    if (args.inproc || !node.isLeader()) return;
+    std::lock_guard<std::mutex> lock(peers_mu);
+    std::vector<std::tuple<int, std::string, int>> remaining;
+    for (const auto& p : pending_peers) {
+      int pid; std::string host; int prt;
+      std::tie(pid, host, prt) = p;
+      if (!node.addServer(pid, host + ":" + std::to_string(prt))) {
+        remaining.push_back(p);
+      } else {
+        std::cout << "add_srv ok for peer " << pid << "\n";
       }
-      args.peers.swap(remaining);
-    };
+    }
+    pending_peers.swap(remaining);
+  };
+
+  if (!args.inproc) {
     try_add_peers();
   }
 
@@ -306,6 +310,22 @@ int main(int argc, char** argv) {
   std::atomic<bool> stop{false};
   std::mutex exec_mu;
   std::vector<std::thread> workers;
+  std::thread peer_add_thread;
+
+  if (!args.inproc) {
+    peer_add_thread = std::thread([&]() {
+      while (!stop.load()) {
+        try_add_peers();
+        bool done = false;
+        {
+          std::lock_guard<std::mutex> lock(peers_mu);
+          done = pending_peers.empty();
+        }
+        if (done) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
+  }
 
   auto process_line = [&](const std::string& line) -> std::string {
     if (line == "PING") return "PONG";
@@ -387,6 +407,9 @@ int main(int argc, char** argv) {
   close(listen_fd);
   for (auto& t : workers) {
     if (t.joinable()) t.join();
+  }
+  if (peer_add_thread.joinable()) {
+    peer_add_thread.join();
   }
 
   node.shutdown();
