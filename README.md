@@ -121,6 +121,9 @@ Generated output:
 - `analysis-results-<YYYY-MM-DD>/three-node-external/metrics_summary.csv`
 - `analysis-results-<YYYY-MM-DD>/three-node-external/split/*`
 - `analysis-results-<YYYY-MM-DD>/three-node-external/all_to_raft/*`
+- `analysis-results-<YYYY-MM-DD>/three-node-external/latency_cdf_compare.png`
+- `analysis-results-<YYYY-MM-DD>/three-node-external/throughput_bar_compare.png`
+- `analysis-results-<YYYY-MM-DD>/three-node-external/raft_appends_bar_compare.png`
 
 This command always runs with:
 - `--verify-correctness`

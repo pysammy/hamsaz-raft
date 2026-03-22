@@ -68,6 +68,11 @@ RESULT_ROOT=analysis-results-2026-03-21/three-node-external scripts/repro_3node_
 - `all_to_raft/latency_cdf.png`
 - `all_to_raft/latency_scatter.png`
 - `metrics_summary.csv`
+- `latency_cdf_compare.png`
+- `throughput_bar_compare.png`
+- `avg_latency_bar_compare.png`
+- `raft_appends_bar_compare.png`
+- `gate_counters_bar_compare.png`
 
 ## Correctness gates used
 

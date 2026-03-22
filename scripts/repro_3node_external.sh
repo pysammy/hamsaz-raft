@@ -151,6 +151,8 @@ with out_csv.open("w", newline="") as f:
 print(f"[repro] wrote {out_csv}")
 PY
 
+python3 bench/plot_repro_compare.py "${RESULT_ROOT}" >/dev/null 2>&1 || true
+
 cat > "${RESULT_ROOT}/README.md" <<EOF
 # 3-Node External Benchmark Reproduction (${DATE_TAG})
 
@@ -184,6 +186,11 @@ This folder stores a reproducible 3-node external benchmark run with correctness
 - \`all_to_raft/latency_cdf.png\`
 - \`all_to_raft/latency_scatter.png\`
 - \`metrics_summary.csv\` (single table for direct comparison)
+- \`latency_cdf_compare.png\` (common CDF, split vs all-to-raft)
+- \`throughput_bar_compare.png\` (RTT + wall throughput bars)
+- \`avg_latency_bar_compare.png\` (average latency bars)
+- \`raft_appends_bar_compare.png\` (Raft pressure bars)
+- \`gate_counters_bar_compare.png\` (queued/appended/dropped counters)
 
 ## How to reproduce exactly
 
