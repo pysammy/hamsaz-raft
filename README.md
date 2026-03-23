@@ -13,6 +13,58 @@ git clone https://github.com/pysammy/hamsaz-raft.git
 cd hamsaz-raft
 ```
 
+## Fastest Repro (copy-paste)
+
+Use this if you just want to build and generate the canonical 3-node comparison plots.
+
+### macOS
+
+```bash
+brew install cmake openssl pkg-config python
+python3 -m pip install matplotlib
+git clone https://github.com/pysammy/hamsaz-raft.git
+cd hamsaz-raft
+cmake -S . -B build -DHAMSAZ_WITH_NURAFT=ON -DHAMSAZ_BUILD_TESTS=ON
+cmake --build build -j
+bash scripts/repro_3node_external.sh
+```
+
+### Windows (WSL2 Ubuntu)
+
+Run in PowerShell once (admin), if Ubuntu is not installed:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Then run inside Ubuntu terminal:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git build-essential cmake pkg-config libssl-dev python3 python3-pip
+python3 -m pip install matplotlib
+cd ~
+git clone https://github.com/pysammy/hamsaz-raft.git
+cd hamsaz-raft
+cmake -S . -B build -DHAMSAZ_WITH_NURAFT=ON -DHAMSAZ_BUILD_TESTS=ON
+cmake --build build -j
+bash scripts/repro_3node_external.sh
+```
+
+Expected output folder:
+
+```text
+analysis-results-<YYYY-MM-DD>/three-node-external/
+```
+
+Key files to read:
+- `metrics_summary.csv`
+- `latency_cdf_compare.png`
+- `throughput_bar_compare.png`
+- `avg_latency_bar_compare.png`
+- `raft_appends_bar_compare.png`
+- `gate_counters_bar_compare.png`
+
 ## What this project implements
 
 - Operation routing by class:
