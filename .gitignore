@@ -21,6 +21,7 @@ __pycache__/
 
 # Research notes / local analysis folders (not part of runtime repo)
 analysis-results-*/
+windows results/
 docs/
 myroughplan.md
 DEPENDENCIES_AND_CONFLICTS_IMPLEMENTATION.md
