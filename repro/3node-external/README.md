@@ -95,7 +95,9 @@ If correctness fails, the script exits non-zero.
 ## How to read `metrics_summary.csv`
 
 - `ops_requested`: target workload size (`--ops`)
-- `ops_reported`: benchmark-accounted operations (can include retry-attempt effects)
+- `ops_reported`: benchmarked operations (should match `ops_requested`)
+- `attempts_total`: all internal attempts, including retries
+- `retries_total`: `attempts_total - ops_reported`
 - `raft_appends_total`: total Raft log pressure indicator
 - `converged`, `invariants_ok`, `op_failures`: correctness and safety outcomes
 
@@ -103,7 +105,7 @@ For protocol comparisons, prioritize:
 
 1. correctness fields (`converged`, `invariants_ok`, `op_failures`)
 2. Raft pressure (`raft_appends_total`)
-3. throughput/latency fields
+3. throughput/latency fields, with `retries_total` as context
 
 ## Reference expectation
 

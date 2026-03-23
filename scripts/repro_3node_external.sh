@@ -129,10 +129,15 @@ allr = json.loads((root / "all_to_raft" / "summary.json").read_text())
 def row(label, s):
     gate = s.get("conflict_gate_stats", {})
     corr = s.get("correctness", {})
+    attempts_total = int(s.get("attempts_total", s.get("ops", 0)))
+    retries_total = int(s.get("retries_total", max(0, attempts_total - int(s.get("ops", 0))))
+    )
     return {
         "case": label,
         "ops_requested": ops_requested,
         "ops_reported": s.get("ops"),
+        "attempts_total": attempts_total,
+        "retries_total": retries_total,
         "concurrency": s.get("concurrency"),
         "avg_latency_ms": round(float(s.get("avg_latency_sec", 0.0)) * 1000.0, 3),
         "throughput_rtt_ops_sec": round(float(s.get("throughput_ops_per_sec", 0.0)), 3),
@@ -221,10 +226,12 @@ RESULT_ROOT=analysis-results-${DATE_TAG}/three-node-external scripts/repro_3node
 - In \`metrics_summary.csv\`:
   - \`split_routing\` should show significantly fewer \`raft_appends_total\` than \`all_to_raft\`.
 
-## Interpreting \`ops_reported\`
+## Interpreting operation counters
 
 - \`ops_requested\` is the intended workload size (fixed by \`--ops\`).
-- \`ops_reported\` comes from current benchmark accounting and may include retry-attempt effects in all-to-raft mode under transient append rejections.
+- \`ops_reported\` is the number of benchmarked operations and should match \`ops_requested\`.
+- \`attempts_total\` includes internal retries when a call is retried.
+- \`retries_total = attempts_total - ops_reported\`.
 - For correctness comparisons, use \`converged\`, \`invariants_ok\`, and \`op_failures\`; for pressure comparisons, use \`raft_appends_total\`.
 
 ## Notes

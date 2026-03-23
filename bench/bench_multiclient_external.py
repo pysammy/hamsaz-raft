@@ -171,6 +171,8 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
     all_conns: List[NodeConn] = []
     conn_mu = threading.Lock()
     failures = 0
+    attempts_total = 0
+    attempts_mu = threading.Lock()
     time_mu = threading.Lock()
     first_send = None
     last_finish = None
@@ -192,23 +194,21 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
         return c
 
     def one(i: int):
-        nonlocal first_send, last_finish, failures
+        nonlocal first_send, last_finish, failures, attempts_total
         idx = targets[i]
         cmd, a1, a2 = ops[i].split("\t")
         line = f"EXEC\t{op_prefix}-op-{i+1}\t{cmd}\t{a1}\t{a2}"
         c = get_conn(idx)
         max_attempts = max(1, max_retries + 1)
+        op_start = time.time()
         for attempt in range(max_attempts):
+            with attempts_mu:
+                attempts_total += 1
             t0 = time.time()
             with time_mu:
                 if first_send is None:
                     first_send = t0
             resp = c.request(line)
-            t1 = time.time()
-            with time_mu:
-                last_finish = t1
-            with lat_mu:
-                latencies.append(t1 - t0)
 
             parts = resp.split("\t", 2)
             if len(parts) < 2 or parts[0] != "RES":
@@ -216,8 +216,19 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
             ok = parts[1] == "1"
             msg = parts[2] if len(parts) >= 3 else ""
             if ok or msg.startswith("Deferred"):
+                t_done = time.time()
+                with time_mu:
+                    last_finish = t_done
+                with lat_mu:
+                    # Per-op end-to-end latency, including any retries.
+                    latencies.append(t_done - op_start)
                 return
             if attempt + 1 >= max_attempts:
+                t_done = time.time()
+                with time_mu:
+                    last_finish = t_done
+                with lat_mu:
+                    latencies.append(t_done - op_start)
                 if fail_on_op_errors:
                     raise RuntimeError(f"operation failed after retries: {resp}")
                 with fail_mu:
@@ -238,7 +249,7 @@ def run_workload(endpoints: List[Tuple[str, int]], ops: List[str], concurrency: 
         c.close()
 
     wall = 0.0 if first_send is None or last_finish is None else (last_finish - first_send)
-    return latencies, wall, failures
+    return latencies, wall, failures, attempts_total
 
 
 def fetch_stats(endpoints: List[Tuple[str, int]]):
@@ -390,7 +401,7 @@ def main():
     ops = build_workload(args.ops, args.conflict_ratio, args.dependent_ratio)
     print(f"[bench_ext] sending {len(ops)} ops concurrency={args.concurrency} endpoints={len(endpoints)}")
     op_prefix = f"ext-{now_ts()}-{random.randrange(1_000_000)}"
-    latencies, wall_span, op_failures = run_workload(
+    latencies, wall_span, op_failures, attempts_total = run_workload(
         endpoints, ops, args.concurrency, op_prefix,
         args.max_retries, args.retry_delay_ms, args.fail_on_op_errors,
         args.request_timeout_sec
@@ -431,6 +442,8 @@ def main():
         "endpoints": [f"{h}:{p}" for h, p in endpoints],
         "correctness": correctness,
         "op_failures": op_failures,
+        "attempts_total": attempts_total,
+        "retries_total": max(0, attempts_total - len(ops)),
     }
     with open(run_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)

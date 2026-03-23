@@ -43,6 +43,16 @@ cd hamsaz-raft
 - `deploy/k8s/` - Kubernetes manifests
 - `proto/` - operation protocol definitions
 
+## Platform support
+
+- macOS: supported (native)
+- Linux: supported (native)
+- Windows: supported via WSL2 Ubuntu
+  - use `wsl -d Ubuntu`
+  - run repo from Linux home (for example `~/hamsaz-raft`), not `/mnt/c` or `/mnt/e`
+
+Native PowerShell/CMD build is not the primary tested path.
+
 ## Prerequisites
 
 ### macOS (Homebrew)
@@ -195,6 +205,12 @@ The benchmark outputs both forms:
   - `throughput_wall = n / (last_finish_time - first_send_time)`
 
 CSV + JSON outputs are written under `artifacts/`.
+
+For `scripts/repro_3node_external.sh`, `metrics_summary.csv` includes:
+- `ops_requested`, `ops_reported`
+- `attempts_total`, `retries_total`
+
+Use `retries_total` as context when interpreting latency/throughput on heavily retried runs.
 
 ## Troubleshooting
 
